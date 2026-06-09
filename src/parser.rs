@@ -18,7 +18,7 @@ pub fn parse(input: &str) -> ParsedInput {
     if input.trim().is_empty() {
         return ParsedInput::Empty;
     }
-    let mut commands: Vec<Command> = input.split("|").map(|s| parse_command(s)).collect();
+    let mut commands: Vec<Command> = input.split("|").map(parse_command).collect();
     if commands.len() == 1 {
         ParsedInput::Single(commands.pop().unwrap())
     } else {
@@ -44,17 +44,17 @@ fn parse_command(segment: &str) -> Command {
     }
 
     Command {
-        program: program,
-        args: args,
-        redirect_in: redirect_in,
-        redirect_out: redirect_out,
-        redirect_append: redirect_append,
+        program,
+        args,
+        redirect_in,
+        redirect_out,
+        redirect_append,
     }
 }
 
 fn expand_var(token: String) -> String {
     if token.starts_with('$') {
-        let name = &token[1..]; // strip the '$'
+        let name = &token.strip_prefix('$').unwrap_or_default(); // strip the '$'
         std::env::var(name).unwrap_or(token.clone()) // look up, fall back to original if not found
     } else {
         token

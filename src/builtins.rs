@@ -26,7 +26,7 @@ fn run_pwd() -> Result<bool, String> {
 }
 
 fn run_cd(args: &[String]) -> Result<bool, String> {
-    if args.len() == 0 {
+    if args.is_empty() {
         let home_dir = env::var("HOME");
         match home_dir {
             Ok(home) => {
