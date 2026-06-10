@@ -28,7 +28,13 @@ fn main() {
                 let _ = rl.add_history_entry(&line);
                 history.push(line.clone());
 
-                let parsed = parser::parse(&line);
+                let parsed = match parser::parse(&line) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        continue;
+                    }
+                };
 
                 // check if it's a builtin first
                 let is_builtin = match &parsed {
