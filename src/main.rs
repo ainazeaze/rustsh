@@ -55,7 +55,7 @@ fn main() {
                 match result {
                     Ok(true) => {}
                     Ok(false) => break,
-                    Err(e) => eprintln!("error: {}", e),
+                    Err(e) => eprintln!("Misy tsy mety izy zany zoky e: {}", e),
                 }
             }
             Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => break,
