@@ -1,3 +1,6 @@
+use std::iter::Peekable;
+use std::str::Chars;
+
 #[derive(Debug)]
 pub struct Command {
     pub program: String,
@@ -50,6 +53,8 @@ pub fn parse(input: &str) -> Result<ParsedInput, String> {
 
 /// Split the raw input into tokens, honoring single and double quotes so that
 /// whitespace and operators (`| < > >>`) inside quotes are treated literally.
+/// Variable references (`$VAR`, `${VAR}`) are expanded inline everywhere except
+/// inside single quotes.
 fn tokenize(input: &str) -> Result<Vec<Token>, String> {
     let mut tokens: Vec<Token> = Vec::new();
     let mut chars = input.chars().peekable();
@@ -57,21 +62,20 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
     // the word currently being assembled
     let mut current = String::new();
     let mut has_word = false; // distinguishes an empty word ("") from no word
-    let mut quoted = false; // whether any part of this word was quoted
 
     while let Some(c) = chars.next() {
         match c {
-            ' ' | '\t' => flush_word(&mut tokens, &mut current, &mut has_word, &mut quoted),
+            ' ' | '\t' => flush_word(&mut tokens, &mut current, &mut has_word),
             '|' => {
-                flush_word(&mut tokens, &mut current, &mut has_word, &mut quoted);
+                flush_word(&mut tokens, &mut current, &mut has_word);
                 tokens.push(Token::Pipe);
             }
             '<' => {
-                flush_word(&mut tokens, &mut current, &mut has_word, &mut quoted);
+                flush_word(&mut tokens, &mut current, &mut has_word);
                 tokens.push(Token::RedirectIn);
             }
             '>' => {
-                flush_word(&mut tokens, &mut current, &mut has_word, &mut quoted);
+                flush_word(&mut tokens, &mut current, &mut has_word);
                 if chars.peek() == Some(&'>') {
                     chars.next();
                     tokens.push(Token::RedirectAppend);
@@ -79,9 +83,13 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                     tokens.push(Token::RedirectOut);
                 }
             }
+            '$' => {
+                has_word = true;
+                expand_var(&mut chars, &mut current)?;
+            }
             '\'' => {
                 has_word = true;
-                quoted = true;
+                // single quotes are fully literal: no expansion, no operators
                 loop {
                     match chars.next() {
                         Some('\'') => break,
@@ -92,10 +100,11 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
             }
             '"' => {
                 has_word = true;
-                quoted = true;
+                // double quotes are literal except for variable expansion
                 loop {
                     match chars.next() {
                         Some('"') => break,
+                        Some('$') => expand_var(&mut chars, &mut current)?,
                         Some(ch) => current.push(ch),
                         None => return Err("syntax error: unterminated double quote".into()),
                     }
@@ -107,29 +116,70 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
             }
         }
     }
-    flush_word(&mut tokens, &mut current, &mut has_word, &mut quoted);
+    flush_word(&mut tokens, &mut current, &mut has_word);
 
     Ok(tokens)
 }
 
 /// Finalize the word being assembled (if any) and push it as a token.
-/// Unquoted words go through variable expansion; quoted words stay literal.
-fn flush_word(
-    tokens: &mut Vec<Token>,
-    current: &mut String,
-    has_word: &mut bool,
-    quoted: &mut bool,
-) {
+fn flush_word(tokens: &mut Vec<Token>, current: &mut String, has_word: &mut bool) {
     if *has_word {
-        let word = if *quoted {
-            std::mem::take(current)
-        } else {
-            expand_var(std::mem::take(current))
-        };
-        tokens.push(Token::Word(word));
+        tokens.push(Token::Word(std::mem::take(current)));
         *has_word = false;
-        *quoted = false;
     }
+}
+
+/// Expand a variable reference whose leading `$` has already been consumed,
+/// appending its value to `out`. Supports `$NAME` and `${NAME}`. An unset
+/// variable, or a lone `$` not followed by a name, is left as literal text.
+fn expand_var(chars: &mut Peekable<Chars>, out: &mut String) -> Result<(), String> {
+    let braced = chars.peek() == Some(&'{');
+    let mut name = String::new();
+
+    if braced {
+        chars.next(); // consume '{'
+        loop {
+            match chars.next() {
+                Some('}') => break,
+                Some(ch) => name.push(ch),
+                None => return Err("syntax error: unterminated '${'".into()),
+            }
+        }
+    } else {
+        while let Some(&ch) = chars.peek() {
+            if ch.is_alphanumeric() || ch == '_' {
+                name.push(ch);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+    }
+
+    // a lone `$` (or `${}`) with no name: keep it literal
+    if name.is_empty() {
+        out.push('$');
+        if braced {
+            out.push_str("{}");
+        }
+        return Ok(());
+    }
+
+    match std::env::var(&name) {
+        Ok(value) => out.push_str(&value),
+        Err(_) => {
+            // unset variable: preserve the original literal text
+            out.push('$');
+            if braced {
+                out.push('{');
+                out.push_str(&name);
+                out.push('}');
+            } else {
+                out.push_str(&name);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Assemble a single command from its (pipe-free) token group.
@@ -164,6 +214,7 @@ fn build_command(tokens: Vec<Token>) -> Result<Command, String> {
     })
 }
 
+/// Consume the next token as a redirection target, or report a syntax error.
 fn expect_filename(
     tokens: &mut impl Iterator<Item = Token>,
     operator: &str,
@@ -174,14 +225,5 @@ fn expect_filename(
             "syntax error: expected filename after '{}'",
             operator
         )),
-    }
-}
-
-fn expand_var(token: String) -> String {
-    if token.starts_with('$') {
-        let name = &token.strip_prefix('$').unwrap_or_default(); // strip the '$'
-        std::env::var(name).unwrap_or(token.clone()) // look up, fall back to original if not found
-    } else {
-        token
     }
 }
