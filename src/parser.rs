@@ -14,14 +14,33 @@ pub enum ParsedInput {
     Pipeline(Vec<Command>), // for cmd1 | cmd2 | cmd3
 }
 
+/// A lexical token produced by the tokenizer, before we know command structure.
+#[derive(Debug, PartialEq)]
+enum Token {
+    Word(String),
+    Pipe,
+    RedirectIn,
+    RedirectOut,
+    RedirectAppend,
+}
+
 pub fn parse(input: &str) -> Result<ParsedInput, String> {
-    if input.trim().is_empty() {
+    let tokens = tokenize(input)?;
+    if tokens.is_empty() {
         return Ok(ParsedInput::Empty);
     }
-    let mut commands: Vec<Command> = input
-        .split('|')
-        .map(parse_command)
-        .collect::<Result<_, _>>()?;
+
+    // split the token stream on pipes into per-command groups
+    let mut commands: Vec<Command> = Vec::new();
+    let mut group: Vec<Token> = Vec::new();
+    for token in tokens {
+        match token {
+            Token::Pipe => commands.push(build_command(std::mem::take(&mut group))?),
+            other => group.push(other),
+        }
+    }
+    commands.push(build_command(group)?);
+
     if commands.len() == 1 {
         Ok(ParsedInput::Single(commands.pop().unwrap()))
     } else {
@@ -29,27 +48,113 @@ pub fn parse(input: &str) -> Result<ParsedInput, String> {
     }
 }
 
-fn parse_command(segment: &str) -> Result<Command, String> {
-    let mut split_peekable = segment.split_whitespace().peekable();
+/// Split the raw input into tokens, honoring single and double quotes so that
+/// whitespace and operators (`| < > >>`) inside quotes are treated literally.
+fn tokenize(input: &str) -> Result<Vec<Token>, String> {
+    let mut tokens: Vec<Token> = Vec::new();
+    let mut chars = input.chars().peekable();
+
+    // the word currently being assembled
+    let mut current = String::new();
+    let mut has_word = false; // distinguishes an empty word ("") from no word
+    let mut quoted = false; // whether any part of this word was quoted
+
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' | '\t' => flush_word(&mut tokens, &mut current, &mut has_word, &mut quoted),
+            '|' => {
+                flush_word(&mut tokens, &mut current, &mut has_word, &mut quoted);
+                tokens.push(Token::Pipe);
+            }
+            '<' => {
+                flush_word(&mut tokens, &mut current, &mut has_word, &mut quoted);
+                tokens.push(Token::RedirectIn);
+            }
+            '>' => {
+                flush_word(&mut tokens, &mut current, &mut has_word, &mut quoted);
+                if chars.peek() == Some(&'>') {
+                    chars.next();
+                    tokens.push(Token::RedirectAppend);
+                } else {
+                    tokens.push(Token::RedirectOut);
+                }
+            }
+            '\'' => {
+                has_word = true;
+                quoted = true;
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(ch) => current.push(ch),
+                        None => return Err("syntax error: unterminated single quote".into()),
+                    }
+                }
+            }
+            '"' => {
+                has_word = true;
+                quoted = true;
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some(ch) => current.push(ch),
+                        None => return Err("syntax error: unterminated double quote".into()),
+                    }
+                }
+            }
+            _ => {
+                current.push(c);
+                has_word = true;
+            }
+        }
+    }
+    flush_word(&mut tokens, &mut current, &mut has_word, &mut quoted);
+
+    Ok(tokens)
+}
+
+/// Finalize the word being assembled (if any) and push it as a token.
+/// Unquoted words go through variable expansion; quoted words stay literal.
+fn flush_word(
+    tokens: &mut Vec<Token>,
+    current: &mut String,
+    has_word: &mut bool,
+    quoted: &mut bool,
+) {
+    if *has_word {
+        let word = if *quoted {
+            std::mem::take(current)
+        } else {
+            expand_var(std::mem::take(current))
+        };
+        tokens.push(Token::Word(word));
+        *has_word = false;
+        *quoted = false;
+    }
+}
+
+/// Assemble a single command from its (pipe-free) token group.
+fn build_command(tokens: Vec<Token>) -> Result<Command, String> {
+    let mut iter = tokens.into_iter();
+    let mut program: Option<String> = None;
+    let mut args: Vec<String> = Vec::new();
     let mut redirect_in: Option<String> = None;
     let mut redirect_out: Option<String> = None;
     let mut redirect_append: Option<String> = None;
 
-    let program: String = match split_peekable.next() {
-        Some(token) => expand_var(token.to_string()),
-        None => return Err("syntax error: empty command".into()),
-    };
-
-    let mut args: Vec<String> = Vec::new();
-    while let Some(token) = split_peekable.next() {
+    while let Some(token) = iter.next() {
         match token {
-            "<" => redirect_in = Some(expect_target(&mut split_peekable, token)?),
-            ">" => redirect_out = Some(expect_target(&mut split_peekable, token)?),
-            ">>" => redirect_append = Some(expect_target(&mut split_peekable, token)?),
-            _ => args.push(expand_var(token.to_string())),
+            Token::Word(w) => match program {
+                None => program = Some(w),
+                Some(_) => args.push(w),
+            },
+            Token::RedirectIn => redirect_in = Some(expect_filename(&mut iter, "<")?),
+            Token::RedirectOut => redirect_out = Some(expect_filename(&mut iter, ">")?),
+            Token::RedirectAppend => redirect_append = Some(expect_filename(&mut iter, ">>")?),
+            Token::Pipe => unreachable!("pipes are split out before build_command"),
         }
     }
 
+    let program = program.ok_or("syntax error: empty command")?;
     Ok(Command {
         program,
         args,
@@ -59,14 +164,13 @@ fn parse_command(segment: &str) -> Result<Command, String> {
     })
 }
 
-/// Consume the next token as a redirection target, or report a syntax error.
-fn expect_target<'a>(
-    tokens: &mut impl Iterator<Item = &'a str>,
+fn expect_filename(
+    tokens: &mut impl Iterator<Item = Token>,
     operator: &str,
 ) -> Result<String, String> {
     match tokens.next() {
-        Some(target) => Ok(target.to_string()),
-        None => Err(format!(
+        Some(Token::Word(filename)) => Ok(filename),
+        _ => Err(format!(
             "syntax error: expected filename after '{}'",
             operator
         )),
